@@ -30,3 +30,6 @@ instance/
 
 # Gajae Code local state
 .gjc/
+
+# Local report evidence
+증빙사진/
