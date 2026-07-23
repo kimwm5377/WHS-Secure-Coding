@@ -25,6 +25,24 @@
       margin-right: 15px;
       font-weight: 500;
     }
+    nav form {
+      display: inline;
+      margin: 0;
+    }
+    nav button.logout-button {
+      width: auto;
+      margin: 0;
+      padding: 0;
+      border: none;
+      background: none;
+      color: #555;
+      font: inherit;
+      font-weight: 500;
+      cursor: pointer;
+    }
+    nav button.logout-button:hover {
+      color: #000;
+    }
     .container {
       max-width: 800px;
       margin: 40px auto;
@@ -91,7 +109,10 @@
       <a href="{{ url_for('dashboard') }}">대시보드</a>
       <a href="{{ url_for('profile') }}">프로필</a>
       <a href="{{ url_for('report') }}">신고하기</a>
-      <a href="{{ url_for('logout') }}">로그아웃</a>
+      <form method="post" action="{{ url_for('logout') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button type="submit" class="logout-button">로그아웃</button>
+      </form>
     {% else %}
       <a href="{{ url_for('login') }}">로그인</a>
       <a href="{{ url_for('register') }}">회원가입</a>
