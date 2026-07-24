@@ -1,5 +1,4 @@
 import ast
-import hashlib
 import os
 import re
 import sqlite3
@@ -11,13 +10,18 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from werkzeug.security import check_password_hash, generate_password_hash
+from werkzeug.security import check_password_hash
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from app import create_app, socketio, _login_failures
+from app import (
+    LOGIN_FAILURE_MESSAGE,
+    create_app,
+    socketio,
+    _login_failures,
+)
 
 
 class Phase1TestCase(unittest.TestCase):
@@ -31,6 +35,7 @@ class Phase1TestCase(unittest.TestCase):
                 "DATABASE": self.db_path,
                 "APP_ENV": "development",
                 "SESSION_COOKIE_SECURE": False,
+                "AUTO_INIT_DB": True,
             }
         )
         self.client = self.app.test_client()
@@ -51,47 +56,31 @@ class Phase1TestCase(unittest.TestCase):
         return self.extract_csrf_token(response.get_data(as_text=True))
 
     def register_user(self, username="phase1_user", password="password123"):
-        csrf_token = self.get_csrf("/register")
         response = self.client.post(
             "/register",
-            data={"csrf_token": csrf_token, "username": username, "password": password},
+            data={
+                "csrf_token": self.get_csrf("/register"),
+                "username": username,
+                "password": password,
+            },
             follow_redirects=True,
         )
         self.assertEqual(response.status_code, 200)
         return response
 
     def login_user(self, username="phase1_user", password="password123", remote_addr="127.0.0.1"):
-        csrf_token = self.get_csrf("/login")
         response = self.client.post(
             "/login",
-            data={"csrf_token": csrf_token, "username": username, "password": password},
+            data={
+                "csrf_token": self.get_csrf("/login"),
+                "username": username,
+                "password": password,
+            },
             environ_overrides={"REMOTE_ADDR": remote_addr},
             follow_redirects=True,
         )
         self.assertEqual(response.status_code, 200)
         return response
-
-    def create_seed_db(self, db_path, users):
-        with sqlite3.connect(db_path) as connection:
-            cursor = connection.cursor()
-            cursor.execute(
-                "CREATE TABLE user (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, password TEXT NOT NULL, bio TEXT)"
-            )
-            cursor.execute(
-                "CREATE TABLE product (id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL, price TEXT NOT NULL, seller_id TEXT NOT NULL)"
-            )
-            cursor.execute(
-                "CREATE TABLE report (id TEXT PRIMARY KEY, reporter_id TEXT NOT NULL, target_id TEXT NOT NULL, reason TEXT NOT NULL)"
-            )
-            for user in users:
-                cursor.execute(
-                    "INSERT INTO user (id, username, password, bio) VALUES (?, ?, ?, ?)",
-                    user,
-                )
-            connection.commit()
-
-    def file_digest(self, db_path):
-        return hashlib.sha256(Path(db_path).read_bytes()).hexdigest()
 
     def test_T001_register_success(self):
         response = self.register_user()
@@ -100,26 +89,35 @@ class Phase1TestCase(unittest.TestCase):
     def test_T002_register_validation_and_duplicates(self):
         self.register_user(username="dup_user", password="password123")
 
-        duplicate_token = self.get_csrf("/register")
         duplicate_response = self.client.post(
             "/register",
-            data={"csrf_token": duplicate_token, "username": "dup_user", "password": "password123"},
+            data={
+                "csrf_token": self.get_csrf("/register"),
+                "username": "dup_user",
+                "password": "password123",
+            },
             follow_redirects=True,
         )
         self.assertIn("이미 존재하는 사용자명입니다.", duplicate_response.get_data(as_text=True))
 
-        invalid_username_token = self.get_csrf("/register")
         invalid_username_response = self.client.post(
             "/register",
-            data={"csrf_token": invalid_username_token, "username": "한글", "password": "password123"},
+            data={
+                "csrf_token": self.get_csrf("/register"),
+                "username": "한글",
+                "password": "password123",
+            },
             follow_redirects=True,
         )
         self.assertIn("사용자명은 3~20자의 영문, 숫자, 밑줄만 사용할 수 있습니다.", invalid_username_response.get_data(as_text=True))
 
-        invalid_password_token = self.get_csrf("/register")
         invalid_password_response = self.client.post(
             "/register",
-            data={"csrf_token": invalid_password_token, "username": "valid_user", "password": "short"},
+            data={
+                "csrf_token": self.get_csrf("/register"),
+                "username": "valid_user",
+                "password": "short",
+            },
             follow_redirects=True,
         )
         self.assertIn("비밀번호는 최소 8자 이상이어야 합니다.", invalid_password_response.get_data(as_text=True))
@@ -151,135 +149,28 @@ class Phase1TestCase(unittest.TestCase):
     def test_T005_profile_update_success(self):
         self.register_user(username="profile_user", password="password123")
         self.login_user(username="profile_user", password="password123")
-        csrf_token = self.get_csrf("/profile")
         response = self.client.post(
             "/profile",
-            data={"csrf_token": csrf_token, "bio": "updated bio"},
+            data={"csrf_token": self.get_csrf("/profile"), "bio": "updated bio"},
             follow_redirects=True,
         )
         self.assertIn("프로필이 업데이트되었습니다.", response.get_data(as_text=True))
         self.assertIn("updated bio", response.get_data(as_text=True))
 
-    def test_T101_passwords_are_hashed_and_existing_plaintext_is_migrated(self):
+    def test_T101_passwords_are_hashed(self):
         self.register_user(username="hashed_user", password="password123")
         with sqlite3.connect(self.db_path) as connection:
-            row = connection.execute("SELECT password FROM user WHERE username = ?", ("hashed_user",)).fetchone()
+            row = connection.execute(
+                "SELECT password_hash, role, status, balance FROM user WHERE username = ?",
+                ("hashed_user",),
+            ).fetchone()
         self.assertIsNotNone(row)
         self.assertNotEqual(row[0], "password123")
         self.assertTrue(row[0].startswith(("scrypt:", "pbkdf2:")))
         self.assertTrue(check_password_hash(row[0], "password123"))
-
-        migrated_db_path = Path(self.temp_dir.name) / "migrated_market.db"
-        self.create_seed_db(
-            migrated_db_path,
-            [("legacy-user", "legacy_user", "plainpass123", "legacy")],
-        )
-
-        migration_app = create_app(
-            {
-                "TESTING": True,
-                "SECRET_KEY": "migration-secret",
-                "DATABASE": str(migrated_db_path),
-                "APP_ENV": "development",
-                "SESSION_COOKIE_SECURE": False,
-            }
-        )
-        migration_client = migration_app.test_client()
-        with sqlite3.connect(migrated_db_path) as connection:
-            migrated_row = connection.execute("SELECT password FROM user WHERE username = ?", ("legacy_user",)).fetchone()
-        self.assertIsNotNone(migrated_row)
-        self.assertNotEqual(migrated_row[0], "plainpass123")
-        self.assertTrue(check_password_hash(migrated_row[0], "plainpass123"))
-
-        csrf_token = self.extract_csrf_token(migration_client.get("/login").get_data(as_text=True))
-        response = migration_client.post(
-            "/login",
-            data={"csrf_token": csrf_token, "username": "legacy_user", "password": "plainpass123"},
-            follow_redirects=True,
-        )
-        self.assertIn("로그인 성공!", response.get_data(as_text=True))
-
-    def test_T101_already_hashed_password_is_not_rehashed_and_plaintext_free_db_is_unchanged(self):
-        stable_db_path = Path(self.temp_dir.name) / "stable_market.db"
-        existing_hash = generate_password_hash("password123")
-        self.create_seed_db(
-            stable_db_path,
-            [("hashed-user", "hashed_user", existing_hash, "stable")],
-        )
-        before_digest = self.file_digest(stable_db_path)
-
-        create_app(
-            {
-                "TESTING": True,
-                "SECRET_KEY": "stable-secret",
-                "DATABASE": str(stable_db_path),
-                "APP_ENV": "development",
-                "SESSION_COOKIE_SECURE": False,
-            }
-        )
-
-        after_digest = self.file_digest(stable_db_path)
-        with sqlite3.connect(stable_db_path) as connection:
-            stored_hash = connection.execute("SELECT password FROM user WHERE username = ?", ("hashed_user",)).fetchone()[0]
-        self.assertEqual(existing_hash, stored_hash)
-        self.assertEqual(before_digest, after_digest)
-
-    def test_T101_backup_required_for_default_database_migration(self):
-        isolated_dir = Path(self.temp_dir.name) / "backup-check"
-        isolated_dir.mkdir()
-        default_db_path = isolated_dir / "market.db"
-        self.create_seed_db(
-            default_db_path,
-            [("plain-user", "plain_user", "plainpass123", "plain")],
-        )
-
-        with mock.patch.dict(
-            os.environ,
-            {
-                "SECRET_KEY": "backup-secret",
-                "APP_ENV": "development",
-                "MARKET_DB_PATH": str(default_db_path),
-            },
-            clear=False,
-        ):
-            with self.assertRaisesRegex(RuntimeError, "market.baseline.db 백업 파일이 필요합니다"):
-                create_app({"DATABASE": str(default_db_path), "APP_ENV": "development"})
-
-        with sqlite3.connect(default_db_path) as connection:
-            stored_password = connection.execute("SELECT password FROM user WHERE username = ?", ("plain_user",)).fetchone()[0]
-        self.assertEqual(stored_password, "plainpass123")
-
-    def test_T101_migration_rolls_back_on_failure(self):
-        rollback_db_path = Path(self.temp_dir.name) / "rollback_market.db"
-        self.create_seed_db(
-            rollback_db_path,
-            [
-                ("plain-user-1", "plain_user_1", "plainpass123", "one"),
-                ("plain-user-2", "plain_user_2", "plainpass456", "two"),
-            ],
-        )
-
-        with mock.patch(
-            "app.generate_password_hash",
-            side_effect=[generate_password_hash("plainpass123"), RuntimeError("forced migration failure")],
-        ):
-            with self.assertRaisesRegex(RuntimeError, "비밀번호 마이그레이션에 실패했습니다"):
-                create_app(
-                    {
-                        "TESTING": True,
-                        "SECRET_KEY": "rollback-secret",
-                        "DATABASE": str(rollback_db_path),
-                        "APP_ENV": "development",
-                        "SESSION_COOKIE_SECURE": False,
-                    }
-                )
-
-        with sqlite3.connect(rollback_db_path) as connection:
-            passwords = connection.execute(
-                "SELECT username, password FROM user ORDER BY username"
-            ).fetchall()
-        self.assertEqual(passwords[0][1], "plainpass123")
-        self.assertEqual(passwords[1][1], "plainpass456")
+        self.assertEqual(row[1], "user")
+        self.assertEqual(row[2], "active")
+        self.assertEqual(row[3], 100000)
 
     def test_T102_secret_key_required(self):
         env = os.environ.copy()
@@ -288,7 +179,7 @@ class Phase1TestCase(unittest.TestCase):
         env["APP_ENV"] = "development"
         env["MARKET_DB_PATH"] = str(Path(self.temp_dir.name) / "missing_secret.db")
         result = subprocess.run(
-            [sys.executable, "-c", "from app import create_app; create_app()"],
+            [sys.executable, "-c", "from app import create_app; create_app({'TESTING': False, 'AUTO_INIT_DB': False})"],
             cwd=REPO_ROOT,
             env=env,
             capture_output=True,
@@ -301,9 +192,14 @@ class Phase1TestCase(unittest.TestCase):
         ok_env = os.environ.copy()
         ok_env["SECRET_KEY"] = "test-secret-from-env"
         ok_env["APP_ENV"] = "development"
-        ok_env["MARKET_DB_PATH"] = str(Path(self.temp_dir.name) / "with_secret.db")
+        ok_db_path = str(Path(self.temp_dir.name) / "with_secret.db")
+        ok_env["MARKET_DB_PATH"] = ok_db_path
         ok_result = subprocess.run(
-            [sys.executable, "-c", "from app import create_app; create_app(); print('initialized')"],
+            [
+                sys.executable,
+                "-c",
+                "from app import create_app; create_app({'TESTING': True, 'DATABASE': r'" + ok_db_path + "'}); print('initialized')",
+            ],
             cwd=REPO_ROOT,
             env=ok_env,
             capture_output=True,
@@ -314,47 +210,55 @@ class Phase1TestCase(unittest.TestCase):
         self.assertIn("initialized", ok_result.stdout)
 
     def test_T103_csrf_protection_on_state_changes(self):
-        missing_register = self.client.post("/register", data={"username": "a_user", "password": "password123"})
-        self.assertEqual(missing_register.status_code, 400)
-
-        register_token = self.get_csrf("/register")
-        invalid_register = self.client.post(
-            "/register",
-            data={"csrf_token": f"{register_token}x", "username": "a_user", "password": "password123"},
+        self.assertEqual(
+            self.client.post("/register", data={"username": "a_user", "password": "password123"}).status_code,
+            400,
         )
-        self.assertEqual(invalid_register.status_code, 400)
+        self.assertEqual(
+            self.client.post(
+                "/register",
+                data={
+                    "csrf_token": self.get_csrf("/register") + "x",
+                    "username": "a_user",
+                    "password": "password123",
+                },
+            ).status_code,
+            400,
+        )
 
         self.register_user(username="csrf_user", password="password123")
-
-        missing_login = self.client.post("/login", data={"username": "csrf_user", "password": "password123"})
-        self.assertEqual(missing_login.status_code, 400)
-
-        login_token = self.get_csrf("/login")
-        invalid_login = self.client.post(
-            "/login",
-            data={"csrf_token": f"{login_token}x", "username": "csrf_user", "password": "password123"},
+        self.assertEqual(
+            self.client.post("/login", data={"username": "csrf_user", "password": "password123"}).status_code,
+            400,
         )
-        self.assertEqual(invalid_login.status_code, 400)
+        self.assertEqual(
+            self.client.post(
+                "/login",
+                data={
+                    "csrf_token": self.get_csrf("/login") + "x",
+                    "username": "csrf_user",
+                    "password": "password123",
+                },
+            ).status_code,
+            400,
+        )
 
         self.login_user(username="csrf_user", password="password123")
-
         for path, payload in [
             ("/profile", {"bio": "csrf"}),
             ("/product/new", {"title": "item", "description": "desc", "price": "1000"}),
-            ("/report", {"target_id": "target", "reason": "reason"}),
+            ("/report", {"target_type": "user", "target_id": "missing", "reason": "reason"}),
         ]:
-            missing = self.client.post(path, data=payload)
-            self.assertEqual(missing.status_code, 400)
-            token = self.get_csrf(path)
-            invalid = self.client.post(path, data={**payload, "csrf_token": f"{token}x"})
-            self.assertEqual(invalid.status_code, 400)
+            self.assertEqual(self.client.post(path, data=payload).status_code, 400)
+            self.assertEqual(
+                self.client.post(path, data={**payload, "csrf_token": self.get_csrf(path) + "x"}).status_code,
+                400,
+            )
 
         dashboard = self.client.get("/dashboard")
         logout_token = self.extract_csrf_token(dashboard.get_data(as_text=True))
-        missing_logout = self.client.post("/logout", data={})
-        self.assertEqual(missing_logout.status_code, 400)
-        invalid_logout = self.client.post("/logout", data={"csrf_token": f"{logout_token}x"})
-        self.assertEqual(invalid_logout.status_code, 400)
+        self.assertEqual(self.client.post("/logout", data={}).status_code, 400)
+        self.assertEqual(self.client.post("/logout", data={"csrf_token": logout_token + "x"}).status_code, 400)
         valid_logout = self.client.post("/logout", data={"csrf_token": logout_token}, follow_redirects=True)
         self.assertEqual(valid_logout.status_code, 200)
         self.assertIn("로그아웃되었습니다.", valid_logout.get_data(as_text=True))
@@ -364,15 +268,15 @@ class Phase1TestCase(unittest.TestCase):
             response = self.client.get(path, follow_redirects=True)
             self.assertIn("로그인", response.get_data(as_text=True))
 
-        post_logout = self.client.post("/logout", data={})
-        self.assertIn(post_logout.status_code, {302, 400})
-
     def test_T109_session_cookie_attributes(self):
         self.register_user(username="cookie_user", password="password123")
-        login_token = self.get_csrf("/login")
         response = self.client.post(
             "/login",
-            data={"csrf_token": login_token, "username": "cookie_user", "password": "password123"},
+            data={
+                "csrf_token": self.get_csrf("/login"),
+                "username": "cookie_user",
+                "password": "password123",
+            },
         )
         cookie_header = "\n".join(response.headers.getlist("Set-Cookie"))
         self.assertIn("HttpOnly", cookie_header)
@@ -385,18 +289,25 @@ class Phase1TestCase(unittest.TestCase):
                 "SECRET_KEY": "production-secret",
                 "DATABASE": str(Path(self.temp_dir.name) / "production.db"),
                 "APP_ENV": "production",
+                "AUTO_INIT_DB": True,
             }
         )
         production_client = production_app.test_client()
-        register_token = self.extract_csrf_token(production_client.get("/register").get_data(as_text=True))
         production_client.post(
             "/register",
-            data={"csrf_token": register_token, "username": "prod_user", "password": "password123"},
+            data={
+                "csrf_token": self.extract_csrf_token(production_client.get("/register").get_data(as_text=True)),
+                "username": "prod_user",
+                "password": "password123",
+            },
         )
-        login_token = self.extract_csrf_token(production_client.get("/login").get_data(as_text=True))
         production_response = production_client.post(
             "/login",
-            data={"csrf_token": login_token, "username": "prod_user", "password": "password123"},
+            data={
+                "csrf_token": self.extract_csrf_token(production_client.get("/login").get_data(as_text=True)),
+                "username": "prod_user",
+                "password": "password123",
+            },
         )
         production_cookie = "\n".join(production_response.headers.getlist("Set-Cookie"))
         self.assertIn("HttpOnly", production_cookie)
@@ -406,34 +317,42 @@ class Phase1TestCase(unittest.TestCase):
     def test_T110_login_rate_limit_behavior(self):
         self.register_user(username="rate_user", password="password123")
 
-        wrong_password_token = self.get_csrf("/login")
         wrong_password_response = self.client.post(
             "/login",
-            data={"csrf_token": wrong_password_token, "username": "rate_user", "password": "wrongpass"},
+            data={
+                "csrf_token": self.get_csrf("/login"),
+                "username": "rate_user",
+                "password": "wrongpass",
+            },
             environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
             follow_redirects=True,
         )
-        wrong_message = "아이디 또는 비밀번호가 올바르지 않습니다."
-        self.assertIn(wrong_message, wrong_password_response.get_data(as_text=True))
+        self.assertIn(LOGIN_FAILURE_MESSAGE, wrong_password_response.get_data(as_text=True))
 
-        nonexistent_token = self.get_csrf("/login")
         nonexistent_response = self.client.post(
             "/login",
-            data={"csrf_token": nonexistent_token, "username": "missing_user", "password": "wrongpass"},
+            data={
+                "csrf_token": self.get_csrf("/login"),
+                "username": "missing_user",
+                "password": "wrongpass",
+            },
             environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
             follow_redirects=True,
         )
-        self.assertIn(wrong_message, nonexistent_response.get_data(as_text=True))
+        self.assertIn(LOGIN_FAILURE_MESSAGE, nonexistent_response.get_data(as_text=True))
 
         for _ in range(3):
-            token = self.get_csrf("/login")
             response = self.client.post(
                 "/login",
-                data={"csrf_token": token, "username": "rate_user", "password": "wrongpass"},
+                data={
+                    "csrf_token": self.get_csrf("/login"),
+                    "username": "rate_user",
+                    "password": "wrongpass",
+                },
                 environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
                 follow_redirects=True,
             )
-            self.assertIn(wrong_message, response.get_data(as_text=True))
+            self.assertIn(LOGIN_FAILURE_MESSAGE, response.get_data(as_text=True))
 
         success_response = self.login_user(username="rate_user", password="password123", remote_addr="127.0.0.1")
         self.assertIn("로그인 성공!", success_response.get_data(as_text=True))
@@ -444,19 +363,25 @@ class Phase1TestCase(unittest.TestCase):
         )
 
         for attempt in range(5):
-            token = self.get_csrf("/login")
             response = self.client.post(
                 "/login",
-                data={"csrf_token": token, "username": "rate_user", "password": "wrongpass"},
+                data={
+                    "csrf_token": self.get_csrf("/login"),
+                    "username": "rate_user",
+                    "password": "wrongpass",
+                },
                 environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
                 follow_redirects=True,
             )
-            self.assertIn(wrong_message, response.get_data(as_text=True), f"attempt {attempt + 1} should record a failure")
+            self.assertIn(LOGIN_FAILURE_MESSAGE, response.get_data(as_text=True), f"attempt {attempt + 1} should record a failure")
 
-        sixth_token = self.get_csrf("/login")
         sixth_response = self.client.post(
             "/login",
-            data={"csrf_token": sixth_token, "username": "rate_user", "password": "wrongpass"},
+            data={
+                "csrf_token": self.get_csrf("/login"),
+                "username": "rate_user",
+                "password": "wrongpass",
+            },
             environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
             follow_redirects=True,
         )
@@ -464,7 +389,9 @@ class Phase1TestCase(unittest.TestCase):
 
     def test_T114_debug_defaults_to_false(self):
         with mock.patch.dict(os.environ, {"SECRET_KEY": "debug-secret", "APP_ENV": "development"}, clear=False):
-            development_app = create_app({"TESTING": False, "DATABASE": str(Path(self.temp_dir.name) / "debug_dev.db")})
+            development_app = create_app(
+                {"TESTING": False, "DATABASE": str(Path(self.temp_dir.name) / "debug_dev.db"), "AUTO_INIT_DB": False}
+            )
             self.assertFalse(development_app.config["DEBUG"])
 
         with mock.patch.dict(
@@ -472,7 +399,9 @@ class Phase1TestCase(unittest.TestCase):
             {"SECRET_KEY": "debug-secret", "APP_ENV": "production", "APP_DEBUG": "true"},
             clear=False,
         ):
-            production_app = create_app({"TESTING": False, "DATABASE": str(Path(self.temp_dir.name) / "debug_prod.db")})
+            production_app = create_app(
+                {"TESTING": False, "DATABASE": str(Path(self.temp_dir.name) / "debug_prod.db"), "AUTO_INIT_DB": False}
+            )
             self.assertFalse(production_app.config["DEBUG"])
 
         env = os.environ.copy()
@@ -481,6 +410,16 @@ class Phase1TestCase(unittest.TestCase):
         env.pop("APP_DEBUG", None)
         env["APP_PORT"] = "5123"
         env["MARKET_DB_PATH"] = str(Path(self.temp_dir.name) / "debug_run.db")
+        runner_app = create_app(
+            {
+                "TESTING": True,
+                "SECRET_KEY": "debug-secret",
+                "DATABASE": env["MARKET_DB_PATH"],
+                "APP_ENV": "development",
+                "AUTO_INIT_DB": True,
+            }
+        )
+        del runner_app
         process = subprocess.Popen(
             [sys.executable, "app.py"],
             cwd=REPO_ROOT,
@@ -533,25 +472,18 @@ class Phase1TestCase(unittest.TestCase):
 
         visitor = SqlCallVisitor()
         visitor.visit(tree)
-        print(
-            f"T-115 inspected {visitor.total_calls} SQL calls; forbidden patterns found: {len(visitor.forbidden_patterns)}"
-        )
+        print(f"T-115 inspected {visitor.total_calls} SQL calls; forbidden patterns found: {len(visitor.forbidden_patterns)}")
         self.assertGreater(visitor.total_calls, 0)
-        self.assertEqual(
-            len(visitor.forbidden_patterns),
-            0,
-            f"T-115 inspected {visitor.total_calls} SQL calls; forbidden patterns found: {len(visitor.forbidden_patterns)}",
-        )
+        self.assertEqual(len(visitor.forbidden_patterns), 0)
 
     def test_regression_product_create_detail_report_and_chat(self):
         self.register_user(username="regression_user", password="password123")
         self.login_user(username="regression_user", password="password123")
 
-        product_token = self.get_csrf("/product/new")
         product_response = self.client.post(
             "/product/new",
             data={
-                "csrf_token": product_token,
+                "csrf_token": self.get_csrf("/product/new"),
                 "title": "Regression Product",
                 "description": "Regression Description",
                 "price": "1000",
@@ -561,20 +493,27 @@ class Phase1TestCase(unittest.TestCase):
         self.assertIn("상품이 등록되었습니다.", product_response.get_data(as_text=True))
         self.assertIn("Regression Product", product_response.get_data(as_text=True))
 
+        import sqlite3
+
         with sqlite3.connect(self.db_path) as connection:
-            connection.row_factory = sqlite3.Row
             product_row = connection.execute("SELECT id FROM product WHERE title = ?", ("Regression Product",)).fetchone()
         self.assertIsNotNone(product_row)
 
-        detail_response = self.client.get(f"/product/{product_row['id']}")
+        detail_response = self.client.get(f"/product/{product_row[0]}")
         detail_text = detail_response.get_data(as_text=True)
         self.assertIn("Regression Product", detail_text)
         self.assertIn("Regression Description", detail_text)
 
-        report_token = self.get_csrf("/report")
+        with sqlite3.connect(self.db_path) as connection:
+            user_row = connection.execute("SELECT id FROM user WHERE username = ?", ("regression_user",)).fetchone()
         report_response = self.client.post(
             "/report",
-            data={"csrf_token": report_token, "target_id": product_row["id"], "reason": "Regression report"},
+            data={
+                "csrf_token": self.get_csrf("/report"),
+                "target_type": "user",
+                "target_id": user_row[0],
+                "reason": "Regression report",
+            },
             follow_redirects=True,
         )
         self.assertIn("신고가 접수되었습니다.", report_response.get_data(as_text=True))

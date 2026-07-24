@@ -91,6 +91,8 @@
 - 신고에 상태와 대상 종류가 반영
 - 기존 DB 백업 후 신규 DB 생성 절차가 구현 문서와 실행 절차에 반영됨
 - `flask --app app create-admin` 명령으로 초기 관리자 생성 경로가 준비됨
+- 일반 서버 실행 경로(`python app.py`, `flask --app app run`, `python -m flask --app app run`)에서 Phase 2 스키마 검증 실패 시 요청 처리 전에 중단됨
+- `init-db`는 DB 생성 목적의 예외 경로로 유지되고, `init-db --replace`는 서버 종료 후에만 수행하도록 운영 경고가 문서화됨
 
 **테스트 방법**
 - T-006
@@ -101,11 +103,19 @@
 - T-105
 - T-201
 - T-202
+- 추가: `create-admin` 미초기화/구형 DB 거부, `init-db` DB 없음 성공/기본 비덮어쓰기/`--replace` 백업 요구, `python app.py` 구형 스키마 조기 중단, `flask --app app run --no-reload` 구형 스키마 조기 중단
 
 **Phase 2 제외 테스트**
 - T-011, T-012, T-013: Phase 4
 - T-014, T-015: Phase 3
 - T-016, T-017, T-018, T-107: Phase 7 선택 기능
+
+**Phase 2 실제 결과**
+- 완료: `schema_version=2` 기반 새 DB 스키마, `flask --app app init-db`, `flask --app app create-admin`, 일반 회원가입의 `role=user`/`status=active`/`balance=100000` 강제, 상품 가격 INTEGER 저장, 상품/신고 입력 검증, 일반 서버 실행 경로의 사전 스키마 검증, Phase 1 보안 기능 회귀 유지
+- 통과 테스트: T-006, T-007, T-009, T-010, T-104, T-105, T-201, T-202
+- 추가 통과 테스트: 일반 회원가입의 관리자 생성 차단, 신규 사용자 기본 상태값 확인, 관리자 CLI 생성/중복 거부, 관리자 CLI의 미초기화/구형 DB 거부, init-db DB 없음 성공, init-db 비덮어쓰기, init-db `--replace` 백업 요구, DB CHECK 제약조건, DB 외래키 제약조건, `python app.py` 구형 스키마 조기 중단, `flask --app app run --no-reload` 구형 스키마 조기 중단
+- 정리: Phase 1 시작 시 자동 평문 비밀번호 마이그레이션은 제거했고, 기존 상태는 `market.phase1.db`에 보존함
+- 주의: 서버 실행 경로와 CLI 경로 구분은 현재 프로세스의 공식 실행 인자(`run`, `init-db`, `create-admin`)를 기준으로 판단한다. 비표준 실행 방식에서는 동일한 조기 검증이 보장되지 않을 수 있다.
 
 ### Phase 3. 상품 검색 및 가격 필터
 **목표**
