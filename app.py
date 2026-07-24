@@ -1,5 +1,4 @@
 import sys
-
 import getpass
 import os
 import re
@@ -34,7 +33,11 @@ PASSWORD_MIN_LENGTH = 8
 CSRF_SESSION_KEY = "_csrf_token"
 LOGIN_FAILURE_WINDOW_SECONDS = 600
 LOGIN_FAILURE_LIMIT = 5
+CHAT_WINDOW_SECONDS = 10
+CHAT_LIMIT = 5
 DEFAULT_SESSION_LIFETIME = timedelta(minutes=30)
+SEARCH_QUERY_MAX_LENGTH = 100
+TRANSFER_NOTE_MAX_LENGTH = 200
 LOGIN_FAILURE_MESSAGE = "아이디 또는 비밀번호가 올바르지 않습니다."
 LOGIN_RATE_LIMIT_MESSAGE = "로그인 시도가 너무 많습니다. 잠시 후 다시 시도해주세요."
 MISSING_SECRET_KEY_MESSAGE = (
@@ -86,12 +89,28 @@ EXPECTED_TABLE_COLUMNS = {
         "created_at",
         "reviewed_at",
     ],
+    "transfer": [
+        "id",
+        "sender_id",
+        "receiver_id",
+        "amount",
+        "note",
+        "created_at",
+    ],
+    "admin_audit_log": [
+        "id",
+        "admin_id",
+        "action",
+        "target_type",
+        "target_id",
+        "detail",
+        "created_at",
+    ],
 }
-
-
 
 socketio = SocketIO()
 _login_failures = {}
+_chat_message_times = {}
 
 
 def utc_now_iso():
@@ -176,6 +195,32 @@ def is_login_limited(ip_address, username, now=None):
     return len(attempts) >= LOGIN_FAILURE_LIMIT
 
 
+def cleanup_chat_limits(now=None):
+    now = now or time.time()
+    expired_keys = []
+    for key, attempts in _chat_message_times.items():
+        kept = [attempt for attempt in attempts if now - attempt < CHAT_WINDOW_SECONDS]
+        if kept:
+            _chat_message_times[key] = kept
+        else:
+            expired_keys.append(key)
+    for key in expired_keys:
+        _chat_message_times.pop(key, None)
+
+
+def is_chat_limited(user_id, now=None):
+    now = now or time.time()
+    cleanup_chat_limits(now)
+    return len(_chat_message_times.get(user_id, [])) >= CHAT_LIMIT
+
+
+def record_chat_message(user_id, now=None):
+    now = now or time.time()
+    cleanup_chat_limits(now)
+    attempts = _chat_message_times.setdefault(user_id, [])
+    attempts.append(now)
+
+
 def generate_csrf_token():
     token = session.get(CSRF_SESSION_KEY)
     if not token:
@@ -188,9 +233,9 @@ def validate_csrf_or_abort():
     submitted_token = request.form.get("csrf_token", "")
     session_token = session.get(CSRF_SESSION_KEY, "")
     if not submitted_token or not session_token:
-        abort(400, description="CSRF token missing.")
+        abort(400)
     if not secrets.compare_digest(submitted_token, session_token):
-        abort(400, description="CSRF token invalid.")
+        abort(400)
 
 
 def validate_username(username):
@@ -203,6 +248,14 @@ def validate_password(password):
 
 def normalize_text(value):
     return (value or "").strip()
+
+
+def is_admin(user):
+    return bool(user and user["role"] == "admin")
+
+
+def is_suspended(user):
+    return bool(user and user["status"] == "suspended")
 
 
 def validate_product_form(title, description, price_text):
@@ -266,6 +319,55 @@ def validate_report_form(target_type, target_id, reason):
     }, None
 
 
+def validate_search_form(query, min_price_text, max_price_text):
+    normalized_query = normalize_text(query)
+    normalized_min_price = normalize_text(min_price_text)
+    normalized_max_price = normalize_text(max_price_text)
+
+    if len(normalized_query) > SEARCH_QUERY_MAX_LENGTH:
+        return None, "검색어는 100자 이하여야 합니다."
+    if normalized_min_price and not re.fullmatch(r"\d+", normalized_min_price):
+        return None, "최소 가격은 0 이상의 정수만 입력할 수 있습니다."
+    if normalized_max_price and not re.fullmatch(r"\d+", normalized_max_price):
+        return None, "최대 가격은 0 이상의 정수만 입력할 수 있습니다."
+
+    min_price = int(normalized_min_price) if normalized_min_price else None
+    max_price = int(normalized_max_price) if normalized_max_price else None
+    if min_price is not None and max_price is not None and min_price > max_price:
+        return None, "최소 가격은 최대 가격보다 클 수 없습니다."
+
+    return {
+        "q": normalized_query,
+        "min_price": min_price,
+        "max_price": max_price,
+        "min_price_text": normalized_min_price,
+        "max_price_text": normalized_max_price,
+    }, None
+
+
+def validate_transfer_form(receiver_username, amount_text, note):
+    normalized_receiver_username = normalize_text(receiver_username)
+    normalized_amount = normalize_text(amount_text)
+    normalized_note = normalize_text(note)
+
+    if not normalized_receiver_username:
+        return None, "수신자 사용자명을 입력해주세요."
+    if len(normalized_note) > TRANSFER_NOTE_MAX_LENGTH:
+        return None, "송금 메모는 200자 이하여야 합니다."
+    if not re.fullmatch(r"-?\d+", normalized_amount):
+        return None, "송금 금액은 0보다 큰 정수만 입력할 수 있습니다."
+
+    amount = int(normalized_amount)
+    if amount <= 0:
+        return None, "송금 금액은 0보다 큰 정수만 입력할 수 있습니다."
+
+    return {
+        "receiver_username": normalized_receiver_username,
+        "amount": amount,
+        "note": normalized_note,
+    }, None
+
+
 def configure_connection(db):
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys = ON")
@@ -324,6 +426,10 @@ def get_table_columns(connection, table_name):
         rows = connection.execute("PRAGMA table_info(product)").fetchall()
     elif table_name == "report":
         rows = connection.execute("PRAGMA table_info(report)").fetchall()
+    elif table_name == "transfer":
+        rows = connection.execute("PRAGMA table_info(transfer)").fetchall()
+    elif table_name == "admin_audit_log":
+        rows = connection.execute("PRAGMA table_info(admin_audit_log)").fetchall()
     else:
         return None
     return [row["name"] for row in rows]
@@ -394,6 +500,28 @@ CREATE TABLE report (
     FOREIGN KEY (admin_id) REFERENCES user(id)
 );
 
+CREATE TABLE transfer (
+    id TEXT PRIMARY KEY,
+    sender_id TEXT NOT NULL,
+    receiver_id TEXT NOT NULL,
+    amount INTEGER NOT NULL CHECK (typeof(amount) = 'integer' AND amount > 0),
+    note TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (sender_id) REFERENCES user(id),
+    FOREIGN KEY (receiver_id) REFERENCES user(id)
+);
+
+CREATE TABLE admin_audit_log (
+    id TEXT PRIMARY KEY,
+    admin_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    target_type TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (admin_id) REFERENCES user(id)
+);
+
 INSERT INTO schema_meta (key, value) VALUES ('schema_version', '2');
 """
     )
@@ -420,6 +548,8 @@ def initialize_database_file(db_path, replace=False):
             create_schema(connection)
             if get_schema_version(connection) != SCHEMA_VERSION:
                 raise RuntimeError("스키마 버전 검증에 실패했습니다.")
+            if not has_expected_phase2_schema(connection):
+                raise RuntimeError("스키마 구조 검증에 실패했습니다.")
         os.replace(temp_path, target_path)
     except Exception:
         if os.path.exists(temp_path):
@@ -442,7 +572,6 @@ def ensure_database_usable(app):
         raise RuntimeError(UNSUPPORTED_SCHEMA_MESSAGE) from exc
 
 
-
 def should_validate_database_on_startup(app):
     if app.config.get("TESTING"):
         return False
@@ -452,7 +581,6 @@ def should_validate_database_on_startup(app):
     if any(arg == "run" for arg in args):
         return True
     return False
-
 
 
 def maybe_prepare_testing_database(app):
@@ -469,25 +597,88 @@ def maybe_prepare_testing_database(app):
 def login_required(view_func):
     @wraps(view_func)
     def wrapped_view(*args, **kwargs):
-        user_id = session.get("user_id")
-        if not user_id:
-            return redirect(url_for("login"))
-
-        cursor = get_db().cursor()
-        cursor.execute("SELECT * FROM user WHERE id = ?", (user_id,))
-        current_user = cursor.fetchone()
-        if current_user is None:
+        if g.current_user is None:
             session.clear()
             flash("로그인이 필요합니다.")
             return redirect(url_for("login"))
-
-        g.current_user = current_user
+        if is_suspended(g.current_user):
+            session.clear()
+            flash("정지된 계정은 사용할 수 없습니다.")
+            return redirect(url_for("login"))
         return view_func(*args, **kwargs)
 
     return wrapped_view
 
 
+def admin_required(view_func):
+    @wraps(view_func)
+    @login_required
+    def wrapped_view(*args, **kwargs):
+        if not is_admin(g.current_user):
+            abort(403)
+        return view_func(*args, **kwargs)
+
+    return wrapped_view
+
+
+def record_admin_audit(cursor, admin_id, action, target_type, target_id, detail, created_at):
+    cursor.execute(
+        """
+        INSERT INTO admin_audit_log (
+            id, admin_id, action, target_type, target_id, detail, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(uuid.uuid4()),
+            admin_id,
+            action,
+            target_type,
+            target_id,
+            detail,
+            created_at,
+        ),
+    )
+
+
+def refresh_current_user():
+    if g.current_user is None:
+        return
+    cursor = get_db().cursor()
+    cursor.execute("SELECT * FROM user WHERE id = ?", (g.current_user["id"],))
+    g.current_user = cursor.fetchone()
+
+
 def register_routes(app):
+    @app.before_request
+    def load_logged_in_user():
+        g.current_user = None
+        user_id = session.get("user_id")
+        if not user_id:
+            return
+        cursor = get_db().cursor()
+        cursor.execute("SELECT * FROM user WHERE id = ?", (user_id,))
+        g.current_user = cursor.fetchone()
+
+    @app.context_processor
+    def inject_current_user():
+        return {"current_user": g.get("current_user")}
+
+    @app.errorhandler(400)
+    def handle_bad_request(error):
+        return render_template("error.html", status_code=400, message="잘못된 요청입니다."), 400
+
+    @app.errorhandler(403)
+    def handle_forbidden(error):
+        return render_template("error.html", status_code=403, message="접근이 허용되지 않습니다."), 403
+
+    @app.errorhandler(404)
+    def handle_not_found(error):
+        return render_template("error.html", status_code=404, message="요청한 페이지를 찾을 수 없습니다."), 404
+
+    @app.errorhandler(500)
+    def handle_server_error(error):
+        return render_template("error.html", status_code=500, message="요청을 처리하는 중 오류가 발생했습니다."), 500
+
     @app.route("/")
     def index():
         if session.get("user_id"):
@@ -557,6 +748,9 @@ def register_routes(app):
             user = cursor.fetchone()
 
             if user and check_password_hash(user["password_hash"], password):
+                if is_suspended(user):
+                    flash("정지된 계정은 로그인할 수 없습니다.")
+                    return redirect(url_for("login"))
                 clear_login_failures(ip_address, username)
                 session.clear()
                 session.permanent = True
@@ -581,10 +775,109 @@ def register_routes(app):
     @app.route("/dashboard")
     @login_required
     def dashboard():
+        filters, error_message = validate_search_form(
+            request.args.get("q", ""),
+            request.args.get("min_price", ""),
+            request.args.get("max_price", ""),
+        )
+        if error_message:
+            flash(error_message)
+            return render_template(
+                "dashboard.html",
+                products=[],
+                user=g.current_user,
+                filters={
+                    "q": normalize_text(request.args.get("q", "")),
+                    "min_price_text": normalize_text(request.args.get("min_price", "")),
+                    "max_price_text": normalize_text(request.args.get("max_price", "")),
+                },
+            )
+
         cursor = get_db().cursor()
-        cursor.execute("SELECT * FROM product ORDER BY created_at DESC")
+        query_text = filters["q"]
+        min_price = filters["min_price"]
+        max_price = filters["max_price"]
+        like_value = f"%{query_text}%"
+
+        if is_admin(g.current_user):
+            if query_text and min_price is not None and max_price is not None:
+                cursor.execute(
+                    "SELECT * FROM product WHERE (title LIKE ? OR description LIKE ?) AND price >= ? AND price <= ? ORDER BY created_at DESC",
+                    (like_value, like_value, min_price, max_price),
+                )
+            elif query_text and min_price is not None:
+                cursor.execute(
+                    "SELECT * FROM product WHERE (title LIKE ? OR description LIKE ?) AND price >= ? ORDER BY created_at DESC",
+                    (like_value, like_value, min_price),
+                )
+            elif query_text and max_price is not None:
+                cursor.execute(
+                    "SELECT * FROM product WHERE (title LIKE ? OR description LIKE ?) AND price <= ? ORDER BY created_at DESC",
+                    (like_value, like_value, max_price),
+                )
+            elif min_price is not None and max_price is not None:
+                cursor.execute(
+                    "SELECT * FROM product WHERE price >= ? AND price <= ? ORDER BY created_at DESC",
+                    (min_price, max_price),
+                )
+            elif query_text:
+                cursor.execute(
+                    "SELECT * FROM product WHERE title LIKE ? OR description LIKE ? ORDER BY created_at DESC",
+                    (like_value, like_value),
+                )
+            elif min_price is not None:
+                cursor.execute(
+                    "SELECT * FROM product WHERE price >= ? ORDER BY created_at DESC",
+                    (min_price,),
+                )
+            elif max_price is not None:
+                cursor.execute(
+                    "SELECT * FROM product WHERE price <= ? ORDER BY created_at DESC",
+                    (max_price,),
+                )
+            else:
+                cursor.execute("SELECT * FROM product ORDER BY created_at DESC")
+        else:
+            if query_text and min_price is not None and max_price is not None:
+                cursor.execute(
+                    "SELECT * FROM product WHERE status = ? AND (title LIKE ? OR description LIKE ?) AND price >= ? AND price <= ? ORDER BY created_at DESC",
+                    ("active", like_value, like_value, min_price, max_price),
+                )
+            elif query_text and min_price is not None:
+                cursor.execute(
+                    "SELECT * FROM product WHERE status = ? AND (title LIKE ? OR description LIKE ?) AND price >= ? ORDER BY created_at DESC",
+                    ("active", like_value, like_value, min_price),
+                )
+            elif query_text and max_price is not None:
+                cursor.execute(
+                    "SELECT * FROM product WHERE status = ? AND (title LIKE ? OR description LIKE ?) AND price <= ? ORDER BY created_at DESC",
+                    ("active", like_value, like_value, max_price),
+                )
+            elif min_price is not None and max_price is not None:
+                cursor.execute(
+                    "SELECT * FROM product WHERE status = ? AND price >= ? AND price <= ? ORDER BY created_at DESC",
+                    ("active", min_price, max_price),
+                )
+            elif query_text:
+                cursor.execute(
+                    "SELECT * FROM product WHERE status = ? AND (title LIKE ? OR description LIKE ?) ORDER BY created_at DESC",
+                    ("active", like_value, like_value),
+                )
+            elif min_price is not None:
+                cursor.execute(
+                    "SELECT * FROM product WHERE status = ? AND price >= ? ORDER BY created_at DESC",
+                    ("active", min_price),
+                )
+            elif max_price is not None:
+                cursor.execute(
+                    "SELECT * FROM product WHERE status = ? AND price <= ? ORDER BY created_at DESC",
+                    ("active", max_price),
+                )
+            else:
+                cursor.execute("SELECT * FROM product WHERE status = ? ORDER BY created_at DESC", ("active",))
+
         all_products = cursor.fetchall()
-        return render_template("dashboard.html", products=all_products, user=g.current_user)
+        return render_template("dashboard.html", products=all_products, user=g.current_user, filters=filters)
 
     @app.route("/profile", methods=["GET", "POST"])
     @login_required
@@ -598,9 +891,8 @@ def register_routes(app):
                 (bio, utc_now_iso(), g.current_user["id"]),
             )
             get_db().commit()
+            refresh_current_user()
             flash("프로필이 업데이트되었습니다.")
-            cursor.execute("SELECT * FROM user WHERE id = ?", (g.current_user["id"],))
-            g.current_user = cursor.fetchone()
             return redirect(url_for("profile"))
         return render_template("profile.html", user=g.current_user)
 
@@ -651,6 +943,9 @@ def register_routes(app):
         if not product:
             flash("상품을 찾을 수 없습니다.")
             return redirect(url_for("dashboard"))
+        if product["status"] == "blocked" and not is_admin(g.current_user):
+            flash("상품을 찾을 수 없습니다.")
+            return redirect(url_for("dashboard"))
         cursor.execute("SELECT * FROM user WHERE id = ?", (product["seller_id"],))
         seller = cursor.fetchone()
         return render_template("view_product.html", product=product, seller=seller)
@@ -670,6 +965,14 @@ def register_routes(app):
                 return redirect(url_for("report"))
 
             cursor = get_db().cursor()
+            cursor.execute(
+                "SELECT id FROM report WHERE reporter_id = ? AND target_type = ? AND target_id = ? AND status = ?",
+                (g.current_user["id"], cleaned["target_type"], cleaned["target_id"], "pending"),
+            )
+            if cursor.fetchone() is not None:
+                flash("동일한 대상에 대한 검토 중 신고가 이미 존재합니다.")
+                return redirect(url_for("report"))
+
             cursor.execute(
                 """
                 INSERT INTO report (
@@ -696,10 +999,440 @@ def register_routes(app):
             return redirect(url_for("dashboard"))
         return render_template("report.html")
 
+    @app.route("/wallet")
+    @login_required
+    def wallet():
+        cursor = get_db().cursor()
+        cursor.execute(
+            """
+            SELECT transfer.id, transfer.amount, transfer.note, transfer.created_at,
+                   sender.username AS sender_username,
+                   receiver.username AS receiver_username
+            FROM transfer
+            JOIN user AS sender ON sender.id = transfer.sender_id
+            JOIN user AS receiver ON receiver.id = transfer.receiver_id
+            WHERE transfer.sender_id = ? OR transfer.receiver_id = ?
+            ORDER BY transfer.created_at DESC
+            LIMIT 20
+            """,
+            (g.current_user["id"], g.current_user["id"]),
+        )
+        transfers = cursor.fetchall()
+        return render_template("wallet.html", user=g.current_user, transfers=transfers)
+
+    @app.route("/transfer", methods=["POST"])
+    @login_required
+    def transfer():
+        validate_csrf_or_abort()
+        cleaned, error_message = validate_transfer_form(
+            request.form.get("receiver_username", ""),
+            request.form.get("amount", ""),
+            request.form.get("note", ""),
+        )
+        if error_message:
+            flash(error_message)
+            return redirect(url_for("wallet"))
+
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute("SELECT * FROM user WHERE username = ?", (cleaned["receiver_username"],))
+        receiver = cursor.fetchone()
+        if receiver is None:
+            flash("존재하지 않는 수신자입니다.")
+            return redirect(url_for("wallet"))
+        if receiver["id"] == g.current_user["id"]:
+            flash("자기 자신에게 송금할 수 없습니다.")
+            return redirect(url_for("wallet"))
+
+        try:
+            db.execute("BEGIN")
+            cursor.execute("SELECT balance FROM user WHERE id = ?", (g.current_user["id"],))
+            sender_balance_row = cursor.fetchone()
+            if sender_balance_row is None:
+                raise RuntimeError("sender-missing")
+            if sender_balance_row["balance"] < cleaned["amount"]:
+                db.rollback()
+                flash("잔액이 부족합니다.")
+                return redirect(url_for("wallet"))
+
+            cursor.execute(
+                "UPDATE user SET balance = balance - ?, updated_at = ? WHERE id = ?",
+                (cleaned["amount"], utc_now_iso(), g.current_user["id"]),
+            )
+            cursor.execute(
+                "UPDATE user SET balance = balance + ?, updated_at = ? WHERE id = ?",
+                (cleaned["amount"], utc_now_iso(), receiver["id"]),
+            )
+            cursor.execute(
+                """
+                INSERT INTO transfer (
+                    id, sender_id, receiver_id, amount, note, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    g.current_user["id"],
+                    receiver["id"],
+                    cleaned["amount"],
+                    cleaned["note"] or None,
+                    utc_now_iso(),
+                ),
+            )
+            db.commit()
+        except sqlite3.Error:
+            db.rollback()
+            flash("송금을 처리하지 못했습니다.")
+            return redirect(url_for("wallet"))
+
+        refresh_current_user()
+        flash("송금이 완료되었습니다.")
+        return redirect(url_for("wallet"))
+
+    @app.route("/admin")
+    @admin_required
+    def admin_dashboard():
+        cursor = get_db().cursor()
+        cursor.execute("SELECT COUNT(*) AS count FROM user")
+        user_count = cursor.fetchone()["count"]
+        cursor.execute("SELECT COUNT(*) AS count FROM product")
+        product_count = cursor.fetchone()["count"]
+        cursor.execute("SELECT COUNT(*) AS count FROM report WHERE status = ?", ("pending",))
+        pending_report_count = cursor.fetchone()["count"]
+        cursor.execute("SELECT COUNT(*) AS count FROM transfer")
+        transfer_count = cursor.fetchone()["count"]
+        return render_template(
+            "admin_dashboard.html",
+            user_count=user_count,
+            product_count=product_count,
+            pending_report_count=pending_report_count,
+            transfer_count=transfer_count,
+        )
+
+    @app.route("/admin/users")
+    @admin_required
+    def admin_users():
+        cursor = get_db().cursor()
+        cursor.execute("SELECT * FROM user ORDER BY created_at DESC")
+        users = cursor.fetchall()
+        return render_template("admin_users.html", users=users)
+
+    @app.route("/admin/users/<user_id>/suspend", methods=["POST"])
+    @admin_required
+    def admin_suspend_user(user_id):
+        validate_csrf_or_abort()
+        if user_id == g.current_user["id"]:
+            flash("관리자는 자기 자신을 정지할 수 없습니다.")
+            return redirect(url_for("admin_users"))
+
+        reason = normalize_text(request.form.get("reason", "")) or "관리자에 의해 정지됨"
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute("SELECT * FROM user WHERE id = ?", (user_id,))
+        target_user = cursor.fetchone()
+        if target_user is None:
+            abort(404)
+
+        now = utc_now_iso()
+        try:
+            db.execute("BEGIN")
+            cursor.execute(
+                "UPDATE user SET status = ?, suspended_reason = ?, updated_at = ? WHERE id = ?",
+                ("suspended", reason, now, user_id),
+            )
+            record_admin_audit(cursor, g.current_user["id"], "suspend_user", "user", user_id, reason, now)
+            db.commit()
+        except sqlite3.Error:
+            db.rollback()
+            flash("사용자 상태를 변경하지 못했습니다.")
+            return redirect(url_for("admin_users"))
+
+        flash("사용자를 정지했습니다.")
+        return redirect(url_for("admin_users"))
+
+    @app.route("/admin/users/<user_id>/unsuspend", methods=["POST"])
+    @admin_required
+    def admin_unsuspend_user(user_id):
+        validate_csrf_or_abort()
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute("SELECT * FROM user WHERE id = ?", (user_id,))
+        target_user = cursor.fetchone()
+        if target_user is None:
+            abort(404)
+
+        now = utc_now_iso()
+        try:
+            db.execute("BEGIN")
+            cursor.execute(
+                "UPDATE user SET status = ?, suspended_reason = ?, updated_at = ? WHERE id = ?",
+                ("active", None, now, user_id),
+            )
+            record_admin_audit(cursor, g.current_user["id"], "unsuspend_user", "user", user_id, "사용자 정지 해제", now)
+            db.commit()
+        except sqlite3.Error:
+            db.rollback()
+            flash("사용자 상태를 변경하지 못했습니다.")
+            return redirect(url_for("admin_users"))
+
+        flash("사용자 정지를 해제했습니다.")
+        return redirect(url_for("admin_users"))
+
+    @app.route("/admin/products")
+    @admin_required
+    def admin_products():
+        cursor = get_db().cursor()
+        cursor.execute(
+            """
+            SELECT product.*, user.username AS seller_username
+            FROM product
+            JOIN user ON user.id = product.seller_id
+            ORDER BY product.created_at DESC
+            """
+        )
+        products = cursor.fetchall()
+        return render_template("admin_products.html", products=products)
+
+    @app.route("/admin/products/<product_id>/block", methods=["POST"])
+    @admin_required
+    def admin_block_product(product_id):
+        validate_csrf_or_abort()
+        reason = normalize_text(request.form.get("reason", "")) or "관리자에 의해 차단됨"
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute("SELECT * FROM product WHERE id = ?", (product_id,))
+        product = cursor.fetchone()
+        if product is None:
+            abort(404)
+
+        now = utc_now_iso()
+        try:
+            db.execute("BEGIN")
+            cursor.execute(
+                "UPDATE product SET status = ?, blocked_reason = ?, updated_at = ? WHERE id = ?",
+                ("blocked", reason, now, product_id),
+            )
+            record_admin_audit(cursor, g.current_user["id"], "block_product", "product", product_id, reason, now)
+            db.commit()
+        except sqlite3.Error:
+            db.rollback()
+            flash("상품 상태를 변경하지 못했습니다.")
+            return redirect(url_for("admin_products"))
+
+        flash("상품을 차단했습니다.")
+        return redirect(url_for("admin_products"))
+
+    @app.route("/admin/products/<product_id>/unblock", methods=["POST"])
+    @admin_required
+    def admin_unblock_product(product_id):
+        validate_csrf_or_abort()
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute("SELECT * FROM product WHERE id = ?", (product_id,))
+        product = cursor.fetchone()
+        if product is None:
+            abort(404)
+
+        now = utc_now_iso()
+        try:
+            db.execute("BEGIN")
+            cursor.execute(
+                "UPDATE product SET status = ?, blocked_reason = ?, updated_at = ? WHERE id = ?",
+                ("active", None, now, product_id),
+            )
+            record_admin_audit(cursor, g.current_user["id"], "unblock_product", "product", product_id, "상품 차단 해제", now)
+            db.commit()
+        except sqlite3.Error:
+            db.rollback()
+            flash("상품 상태를 변경하지 못했습니다.")
+            return redirect(url_for("admin_products"))
+
+        flash("상품 차단을 해제했습니다.")
+        return redirect(url_for("admin_products"))
+
+    @app.route("/admin/reports")
+    @admin_required
+    def admin_reports():
+        cursor = get_db().cursor()
+        cursor.execute(
+            """
+            SELECT report.*, reporter.username AS reporter_username, admin.username AS admin_username
+            FROM report
+            JOIN user AS reporter ON reporter.id = report.reporter_id
+            LEFT JOIN user AS admin ON admin.id = report.admin_id
+            ORDER BY CASE WHEN report.status = 'pending' THEN 0 ELSE 1 END, report.created_at DESC
+            """
+        )
+        reports = cursor.fetchall()
+        return render_template("admin_reports.html", reports=reports)
+
+    @app.route("/admin/reports/<report_id>/dismiss", methods=["POST"])
+    @admin_required
+    def admin_dismiss_report(report_id):
+        validate_csrf_or_abort()
+        review_note = normalize_text(request.form.get("review_note", "")) or "신고 기각"
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute("SELECT * FROM report WHERE id = ?", (report_id,))
+        report = cursor.fetchone()
+        if report is None:
+            abort(404)
+        if report["status"] != "pending":
+            flash("이미 처리된 신고입니다.")
+            return redirect(url_for("admin_reports"))
+
+        now = utc_now_iso()
+        try:
+            db.execute("BEGIN")
+            cursor.execute(
+                "UPDATE report SET status = ?, admin_id = ?, action_type = ?, review_note = ?, reviewed_at = ? WHERE id = ?",
+                ("dismissed", g.current_user["id"], "none", review_note, now, report_id),
+            )
+            record_admin_audit(cursor, g.current_user["id"], "dismiss_report", "report", report_id, review_note, now)
+            db.commit()
+        except sqlite3.Error:
+            db.rollback()
+            flash("신고를 처리하지 못했습니다.")
+            return redirect(url_for("admin_reports"))
+
+        flash("신고를 기각했습니다.")
+        return redirect(url_for("admin_reports"))
+
+    @app.route("/admin/reports/<report_id>/action", methods=["POST"])
+    @admin_required
+    def admin_action_report(report_id):
+        validate_csrf_or_abort()
+        action_type = normalize_text(request.form.get("action_type", ""))
+        review_note = normalize_text(request.form.get("review_note", "")) or "신고 처리"
+        if action_type not in {"suspend_user", "block_product"}:
+            flash("신고 처리 방식이 올바르지 않습니다.")
+            return redirect(url_for("admin_reports"))
+
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute("SELECT * FROM report WHERE id = ?", (report_id,))
+        report = cursor.fetchone()
+        if report is None:
+            abort(404)
+        if report["status"] != "pending":
+            flash("이미 처리된 신고입니다.")
+            return redirect(url_for("admin_reports"))
+        if action_type == "suspend_user" and report["target_type"] != "user":
+            flash("사용자 신고에만 사용자 정지를 적용할 수 있습니다.")
+            return redirect(url_for("admin_reports"))
+        if action_type == "block_product" and report["target_type"] != "product":
+            flash("상품 신고에만 상품 차단을 적용할 수 있습니다.")
+            return redirect(url_for("admin_reports"))
+        if action_type == "suspend_user" and report["target_id"] == g.current_user["id"]:
+            flash("관리자는 자기 자신을 정지할 수 없습니다.")
+            return redirect(url_for("admin_reports"))
+
+        now = utc_now_iso()
+        try:
+            db.execute("BEGIN")
+            if action_type == "suspend_user":
+                cursor.execute("SELECT id FROM user WHERE id = ?", (report["target_id"],))
+                if cursor.fetchone() is None:
+                    raise RuntimeError("missing-user")
+                cursor.execute(
+                    "UPDATE user SET status = ?, suspended_reason = ?, updated_at = ? WHERE id = ?",
+                    ("suspended", review_note, now, report["target_id"]),
+                )
+                record_admin_audit(
+                    cursor,
+                    g.current_user["id"],
+                    "suspend_user",
+                    "user",
+                    report["target_id"],
+                    review_note,
+                    now,
+                )
+            else:
+                cursor.execute("SELECT id FROM product WHERE id = ?", (report["target_id"],))
+                if cursor.fetchone() is None:
+                    raise RuntimeError("missing-product")
+                cursor.execute(
+                    "UPDATE product SET status = ?, blocked_reason = ?, updated_at = ? WHERE id = ?",
+                    ("blocked", review_note, now, report["target_id"]),
+                )
+                record_admin_audit(
+                    cursor,
+                    g.current_user["id"],
+                    "block_product",
+                    "product",
+                    report["target_id"],
+                    review_note,
+                    now,
+                )
+
+            cursor.execute(
+                "UPDATE report SET status = ?, admin_id = ?, action_type = ?, review_note = ?, reviewed_at = ? WHERE id = ?",
+                ("actioned", g.current_user["id"], action_type, review_note, now, report_id),
+            )
+            record_admin_audit(cursor, g.current_user["id"], "action_report", "report", report_id, review_note, now)
+            db.commit()
+        except sqlite3.Error:
+            db.rollback()
+            flash("신고를 처리하지 못했습니다.")
+            return redirect(url_for("admin_reports"))
+
+        flash("신고를 처리했습니다.")
+        return redirect(url_for("admin_reports"))
+
+    @app.route("/admin/transfers")
+    @admin_required
+    def admin_transfers():
+        cursor = get_db().cursor()
+        cursor.execute(
+            """
+            SELECT transfer.*, sender.username AS sender_username, receiver.username AS receiver_username
+            FROM transfer
+            JOIN user AS sender ON sender.id = transfer.sender_id
+            JOIN user AS receiver ON receiver.id = transfer.receiver_id
+            ORDER BY transfer.created_at DESC
+            """
+        )
+        transfers = cursor.fetchall()
+        return render_template("admin_transfers.html", transfers=transfers)
+
+    @app.route("/admin/audit-logs")
+    @admin_required
+    def admin_audit_logs():
+        cursor = get_db().cursor()
+        cursor.execute(
+            """
+            SELECT admin_audit_log.*, user.username AS admin_username
+            FROM admin_audit_log
+            JOIN user ON user.id = admin_audit_log.admin_id
+            ORDER BY admin_audit_log.created_at DESC
+            """
+        )
+        audit_logs = cursor.fetchall()
+        return render_template("admin_audit_logs.html", audit_logs=audit_logs)
+
 
 @socketio.on("send_message")
 def handle_send_message_event(data):
-    send(data, broadcast=True)
+    user_id = session.get("user_id")
+    if not user_id:
+        return
+
+    message = normalize_text((data or {}).get("message", ""))
+    if not message or len(message) > 500:
+        return
+    if is_chat_limited(user_id):
+        return
+
+    try:
+        with connect_database(current_app.config["DATABASE"]) as connection:
+            user = connection.execute("SELECT username, status FROM user WHERE id = ?", (user_id,)).fetchone()
+    except sqlite3.Error:
+        return
+
+    if user is None or user["status"] != "active":
+        return
+
+    record_chat_message(user_id)
+    send({"username": user["username"], "message": message}, broadcast=True)
 
 
 def register_cli_commands(app):
@@ -799,7 +1532,6 @@ def create_app(test_config=None):
     app.jinja_env.globals["csrf_token"] = generate_csrf_token
     register_routes(app)
     register_cli_commands(app)
-
     socketio.init_app(app)
     return app
 

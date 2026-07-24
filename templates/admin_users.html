@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}사용자 관리{% endblock %}
+{% block content %}
+<h2>사용자 관리</h2>
+<ul>
+  {% for user in users %}
+    <li>
+      {{ user.username }} | role={{ user.role }} | status={{ user.status }} | balance={{ user.balance }}
+      {% if user.suspended_reason %} | reason={{ user.suspended_reason }}{% endif %}
+      {% if user.id != current_user.id %}
+        {% if user.status == 'active' %}
+          <form class="inline-form" method="post" action="{{ url_for('admin_suspend_user', user_id=user.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="text" name="reason" placeholder="정지 사유">
+            <button type="submit">정지</button>
+          </form>
+        {% else %}
+          <form class="inline-form" method="post" action="{{ url_for('admin_unsuspend_user', user_id=user.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button type="submit">정지 해제</button>
+          </form>
+        {% endif %}
+      {% endif %}
+    </li>
+  {% endfor %}
+</ul>
+{% endblock %}

@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}지갑{% endblock %}
+{% block content %}
+<h2>지갑</h2>
+<p>현재 잔액: {{ user.balance }}</p>
+
+<h3>송금</h3>
+<form method="post" action="{{ url_for('transfer') }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  수신자 사용자명: <input type="text" name="receiver_username" required>
+  송금 금액: <input type="text" name="amount" inputmode="numeric" required>
+  메모: <textarea name="note" rows="3" maxlength="200"></textarea>
+  <button type="submit">송금</button>
+</form>
+
+<h3>최근 송금 내역</h3>
+<ul>
+  {% for transfer in transfers %}
+    <li>
+      {{ transfer.created_at }} | {{ transfer.sender_username }} → {{ transfer.receiver_username }} | {{ transfer.amount }}
+      {% if transfer.note %} | {{ transfer.note }}{% endif %}
+    </li>
+  {% else %}
+    <li>송금 내역이 없습니다.</li>
+  {% endfor %}
+</ul>
+{% endblock %}

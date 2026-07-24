@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}송금 내역{% endblock %}
+{% block content %}
+<h2>송금 내역</h2>
+<ul>
+  {% for transfer in transfers %}
+    <li>
+      {{ transfer.created_at }} | {{ transfer.sender_username }} → {{ transfer.receiver_username }} | {{ transfer.amount }}
+      {% if transfer.note %} | {{ transfer.note }}{% endif %}
+    </li>
+  {% else %}
+    <li>송금 내역이 없습니다.</li>
+  {% endfor %}
+</ul>
+{% endblock %}

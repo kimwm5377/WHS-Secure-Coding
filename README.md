@@ -2,12 +2,24 @@
 
 ## Tiny Secondhand Shopping Platform
 
-Flask + SQLite 기반 과제용 중고거래 플랫폼이다.
+Flask + SQLite 기반 시큐어 코딩 과제용 중고거래 플랫폼이다.
+
+## 구현 범위
+현재 구현된 필수 기능:
+- 회원가입 / 로그인 / POST 로그아웃
+- 프로필 수정
+- 상품 등록 / 상세 조회
+- 상품 검색 / 가격 필터
+- 공개 채팅
+- 신고 접수 / 관리자 신고 검토
+- 관리자 사용자 관리 / 상품 관리 / 감사 로그 / 송금 내역 조회
+- 가상 잔액 송금
+
+선택 기능 미구현:
+- 상품별 1:1 문의
+- 문의 메시지 DB 저장
 
 ## 환경 준비
-Miniconda(또는 Anaconda)가 없다면 먼저 설치한다.
-- https://docs.anaconda.com/free/miniconda/index.html
-
 ```bash
 git clone https://github.com/ugonfor/secure-coding
 cd secure-coding
@@ -28,11 +40,6 @@ export APP_DEBUG=false
 - 값이 없으면 애플리케이션은 즉시 종료된다.
 - 임시 키나 하드코딩 기본 키는 사용하지 않는다.
 
-비밀값 생성 예시:
-```bash
-python -c 'import secrets; print(secrets.token_hex(32))'
-```
-
 ## DB 백업 파일
 - `market.baseline.db`: 최초 취약 상태 DB 백업
 - `market.phase1.db`: Phase 1 완료 시점 DB 백업
@@ -40,7 +47,7 @@ python -c 'import secrets; print(secrets.token_hex(32))'
 
 백업 DB는 Git에 추가하지 않는다.
 
-## Phase 2 DB 초기화
+## DB 초기화
 앱은 구형 스키마를 자동 변경하지 않는다.
 새 DB는 명시적으로 초기화해야 한다.
 
@@ -75,7 +82,6 @@ conda run -n secure_coding python -m flask --app app init-db --replace
 test -f market.phase1.db && echo "phase1 backup exists"
 ```
 
-
 ## 초기 관리자 생성
 ```bash
 conda run -n secure_coding python -m flask --app app create-admin
@@ -87,7 +93,7 @@ conda run -n secure_coding python -m flask --app app create-admin
 - 평문 비밀번호는 출력하거나 저장하지 않음
 
 ## 실행
-`market.db`가 Phase 2 스키마로 초기화된 뒤 실행한다.
+`market.db`가 초기화된 뒤 실행한다.
 
 ```bash
 conda activate secure_coding
@@ -99,10 +105,9 @@ python app.py
 - 기본 `debug=False`
 - `APP_DEBUG=true`는 개발 환경에서만 허용
 - 운영 환경(`APP_ENV=production`)에서는 항상 `debug=False`
-- `python app.py`, `flask --app app run`, `python -m flask --app app run`은 요청 처리 전에 Phase 2 스키마를 검증한다.
-- `init-db`는 DB 생성 목적의 예외 경로로 동작하므로 미초기화/구형 DB 상태에서도 실행할 수 있다.
+- `python app.py`, `flask --app app run`, `python -m flask --app app run`은 요청 처리 전에 지원 스키마 여부를 검증한다.
+- `init-db`는 DB 생성 목적의 예외 경로이므로 미초기화/구형 DB 상태에서도 실행할 수 있다.
 - `create-admin`은 유효한 `schema_version=2` DB가 있을 때만 실행할 수 있다.
-
 
 ## 개발/운영 쿠키 설정
 개발 HTTP 환경 (`APP_ENV=development`):
@@ -115,31 +120,35 @@ python app.py
 - `SESSION_COOKIE_SAMESITE=Lax`
 - `SESSION_COOKIE_SECURE=True`
 
-## 로그인 제한
-로그인 보호는 메모리 기반 limiter를 사용한다.
-기준 키는 `request.remote_addr + username`이다.
-
-규칙:
+## 로그인 / 채팅 제한
+로그인 제한:
+- 기준 키: `request.remote_addr + username`
 - 10분 동안 실패 5회까지 기록
 - 6번째 시도부터 차단
 - 로그인 성공 시 실패 기록 초기화
-- 사용자 존재 여부와 관계없이 동일한 실패 메시지 사용
+
+공개 채팅 제한:
+- 로그인 사용자만 전송 가능
+- 사용자당 10초 동안 최대 5개
+- 6번째 메시지부터 차단
+- 클라이언트가 보낸 `username`은 신뢰하지 않고 세션 사용자명을 사용
 
 한계:
-- 프로세스 재시작 시 기록 초기화
-- 다중 프로세스/다중 서버 간 공유되지 않음
+- 로그인 제한과 채팅 제한은 메모리 기반이다.
+- 프로세스 재시작 시 기록이 초기화된다.
+- 다중 프로세스/다중 서버 간에는 공유되지 않는다.
 
 ## 테스트
 공식 테스트 명령:
 
 ```bash
-conda run -n secure_coding python -m unittest discover -s tests -p 'test_phase*.py' -v
+conda run -n secure_coding python -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
 이미 `secure_coding` 환경이 활성화되어 있다면 다음도 가능하다.
 
 ```bash
-python -m unittest discover -s tests -p 'test_phase*.py' -v
+python -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
 ## 운영 주의사항
@@ -154,28 +163,19 @@ python -m unittest discover -s tests -p 'test_phase*.py' -v
 export SECRET_KEY="$(python -c 'import secrets; print(secrets.token_hex(32))')"
 export APP_ENV=development
 conda run -n secure_coding python -m flask --app app init-db --replace
+conda run -n secure_coding python -m flask --app app create-admin
 conda run -n secure_coding python app.py
 ```
 
 브라우저에서 확인할 항목:
 - 회원가입
 - 로그인
+- 검색 / 가격 필터
 - 프로필 수정
 - 상품 등록
 - 잘못된 가격 상품 등록 거부
 - 사용자 신고 / 상품 신고
-- 존재하지 않는 대상 신고 거부
+- 관리자 로그인 후 사용자 정지 / 상품 차단 / 신고 처리
+- 지갑 / 송금
+- 감사 로그 / 송금 내역
 - POST 로그아웃
-
-### DB 교체 주의사항
-
-`init-db --replace`는 애플리케이션 서버를 종료한 상태에서만 실행해야 한다.
-서버가 기존 SQLite 연결을 유지한 상태에서 DB 파일을 교체하면 서로 다른 DB 파일을 참조할 수 있다.
-
-권장 순서:
-
-1. 서버 종료
-2. `market.phase1.db` 백업 확인
-3. `init-db --replace` 실행
-4. `schema_version=2` 확인
-5. 서버 재시작

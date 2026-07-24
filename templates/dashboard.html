@@ -2,13 +2,32 @@
 {% block title %}대시보드{% endblock %}
 {% block content %}
 <h2>대시보드</h2>
+
+<form method="get" action="{{ url_for('dashboard') }}">
+  <label>검색어
+    <input type="text" name="q" maxlength="100" value="{{ filters.q if filters else '' }}" placeholder="제목 또는 설명 검색">
+  </label>
+  <label>최소 가격
+    <input type="text" name="min_price" inputmode="numeric" value="{{ filters.min_price_text if filters else '' }}">
+  </label>
+  <label>최대 가격
+    <input type="text" name="max_price" inputmode="numeric" value="{{ filters.max_price_text if filters else '' }}">
+  </label>
+  <button type="submit">검색</button>
+</form>
+
 <h3>등록된 상품</h3>
 <ul>
   {% for product in products %}
     <li>
       <a href="{{ url_for('view_product', product_id=product.id) }}">{{ product.title }}</a>
       - 가격: {{ product.price }}
+      {% if product.status != 'active' %}
+        ({{ product.status }})
+      {% endif %}
     </li>
+  {% else %}
+    <li>표시할 상품이 없습니다.</li>
   {% endfor %}
 </ul>
 <p><a href="{{ url_for('new_product') }}">새 상품 등록</a></p>
@@ -16,7 +35,7 @@
 <h3>실시간 채팅</h3>
 <div id="chat">
   <ul id="messages"></ul>
-  <input id="chat_input" type="text" placeholder="메시지를 입력하세요">
+  <input id="chat_input" type="text" placeholder="메시지를 입력하세요" maxlength="500">
   <button onclick="sendMessage()">전송</button>
 </div>
 

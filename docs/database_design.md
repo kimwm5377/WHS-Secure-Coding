@@ -5,7 +5,7 @@
 - `sqlite3` + 파라미터 바인딩 유지
 - 앱 시작 시 기존 DB를 자동 파괴 변경하지 않음
 - 새 목표 스키마는 명시적 초기화 명령으로만 생성
-- Phase 2에서는 `user`, `product`, `report`, `schema_meta`까지만 생성
+- 선택 기능인 문의 테이블은 생성하지 않음
 
 ## 2. 백업 파일 역할
 - `market.baseline.db`
@@ -17,7 +17,7 @@
 
 두 백업 파일은 모두 로컬 보존용이며 Git에 포함하지 않는다.
 
-## 3. Phase 2 현재 목표 스키마
+## 3. 현재 목표 스키마
 ### 3.1 `schema_meta`
 | 컬럼 | 타입 | 설명 |
 |---|---|---|
@@ -89,17 +89,43 @@
 
 주의사항:
 - `target_id`는 다형 대상이라 일반 외래키로 강제하지 않는다.
-- 대신 애플리케이션 레벨에서 `target_type`에 맞는 실제 대상 존재 여부를 검증한다.
+- 대신 애플리케이션 레벨에서 실제 대상 존재 여부를 검증한다.
 
-## 4. Phase 2에서 생성하지 않는 테이블
-다음 테이블은 이번 단계에서 생성하지 않는다.
-- `transfer`
-- `admin_audit_log`
+### 3.5 `transfer`
+| 컬럼 | 타입 | 설명 |
+|---|---|---|
+| id | TEXT PK | 송금 ID |
+| sender_id | TEXT NOT NULL | 송신자 |
+| receiver_id | TEXT NOT NULL | 수신자 |
+| amount | INTEGER NOT NULL | 송금 금액 |
+| note | TEXT | 메모 |
+| created_at | TEXT NOT NULL | 생성 시각(UTC ISO 8601) |
+
+제약조건:
+- `typeof(amount) = 'integer' AND amount > 0`
+- `FOREIGN KEY (sender_id) REFERENCES user(id)`
+- `FOREIGN KEY (receiver_id) REFERENCES user(id)`
+
+### 3.6 `admin_audit_log`
+| 컬럼 | 타입 | 설명 |
+|---|---|---|
+| id | TEXT PK | 감사 로그 ID |
+| admin_id | TEXT NOT NULL | 작업 관리자 |
+| action | TEXT NOT NULL | 작업 종류 |
+| target_type | TEXT NOT NULL | 대상 종류 |
+| target_id | TEXT NOT NULL | 대상 ID |
+| detail | TEXT NOT NULL | 상세 메모 |
+| created_at | TEXT NOT NULL | 생성 시각(UTC ISO 8601) |
+
+제약조건:
+- `FOREIGN KEY (admin_id) REFERENCES user(id)`
+
+## 4. 생성하지 않는 테이블
+다음 테이블은 현재도 생성하지 않는다.
 - `product_inquiry`
 - `inquiry_message`
 
 생성 시점:
-- `transfer`, `admin_audit_log`: 해당 기능 구현 단계
 - `product_inquiry`, `inquiry_message`: Phase 7 선택 기능 구현 시
 
 ## 5. SQLite 안전 설정
@@ -133,25 +159,11 @@ python -m flask --app app init-db
 ## 7. 스키마 버전 확인 방식
 - `schema_meta` 테이블의 `schema_version` 값을 사용한다.
 - 현재 지원 버전은 `2`다.
-- `schema_meta`, `user`, `product`, `report` 필수 테이블과 필수 컬럼 목록까지 함께 검증한다.
+- `schema_meta`, `user`, `product`, `report`, `transfer`, `admin_audit_log` 필수 테이블과 필수 컬럼 목록까지 함께 검증한다.
 - `python app.py`, `flask --app app run`, `python -m flask --app app run`은 요청 처리 전에 검증 실패 시 서버를 중단하고 `init-db` 실행을 안내한다.
 - 지원하지 않는 스키마를 발견하면 자동 변경하지 않고 안내 후 실행을 중단한다.
 
-
-## 8. 사용자/상품/신고 데이터 처리
-- 기존 Phase 1 DB 데이터를 자동 이전하지 않는다.
-- 새 `market.db`에서는 회원가입, 상품 등록, 신고를 다시 수행할 수 있어야 한다.
-- 일반 회원가입은 항상 `role='user'`, `status='active'`, `balance=100000`으로 생성한다.
-- `create-admin` CLI로만 관리자 계정을 만든다.
-- `create-admin`은 유효한 `schema_version=2` DB가 있을 때만 실행한다.
-
-
-## 9. Phase 1 마이그레이션 코드 처리
-- Phase 1에서는 기존 DB 보호를 위해 시작 시 평문 비밀번호를 해시로 바꾸는 임시 마이그레이션을 사용했다.
-- Phase 2에서는 새 목표 DB를 명시적으로 생성하므로 시작 시 자동 평문 비밀번호 마이그레이션을 제거했다.
-- 기존 상태는 `market.phase1.db`에 보존한다.
-
-## 10. 유지보수 시 주의사항
+## 8. 유지보수 시 주의사항
 - 새 스키마 변경은 다시 명시적 초기화/마이그레이션 전략으로 다뤄야 한다.
 - `market.baseline.db`, `market.phase1.db`는 실수로 덮어쓰지 않는다.
 - 운영 코드에서 `schema_version` 불일치 시 자동 ALTER를 넣지 않는다.

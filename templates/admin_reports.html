@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}신고 관리{% endblock %}
+{% block content %}
+<h2>신고 관리</h2>
+<ul>
+  {% for report in reports %}
+    <li>
+      {{ report.id }} | reporter={{ report.reporter_username }} | target={{ report.target_type }}:{{ report.target_id }} | status={{ report.status }}
+      {% if report.review_note %} | note={{ report.review_note }}{% endif %}
+      {% if report.admin_username %} | admin={{ report.admin_username }}{% endif %}
+      {% if report.status == 'pending' %}
+        <form class="inline-form" method="post" action="{{ url_for('admin_dismiss_report', report_id=report.id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <input type="text" name="review_note" placeholder="기각 메모">
+          <button type="submit">기각</button>
+        </form>
+        <form class="inline-form" method="post" action="{{ url_for('admin_action_report', report_id=report.id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <select name="action_type">
+            <option value="suspend_user">사용자 정지</option>
+            <option value="block_product">상품 차단</option>
+          </select>
+          <input type="text" name="review_note" placeholder="처리 메모">
+          <button type="submit">처리</button>
+        </form>
+      {% endif %}
+    </li>
+  {% endfor %}
+</ul>
+{% endblock %}

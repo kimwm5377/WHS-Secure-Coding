@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}감사 로그{% endblock %}
+{% block content %}
+<h2>감사 로그</h2>
+<ul>
+  {% for log in audit_logs %}
+    <li>
+      {{ log.created_at }} | admin={{ log.admin_username }} | action={{ log.action }} | {{ log.target_type }}:{{ log.target_id }} | {{ log.detail }}
+    </li>
+  {% else %}
+    <li>감사 로그가 없습니다.</li>
+  {% endfor %}
+</ul>
+{% endblock %}

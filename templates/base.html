@@ -3,10 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <title>{% block title %}My Market{% endblock %}</title>
-  <!-- Socket.IO 클라이언트 라이브러리 -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
   <style>
-    /* Notion 스타일 미니멀 디자인 */
     body {
       background-color: #F7F7F7;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -44,7 +42,7 @@
       color: #000;
     }
     .container {
-      max-width: 800px;
+      max-width: 900px;
       margin: 40px auto;
       background-color: #fff;
       padding: 40px;
@@ -55,13 +53,14 @@
       font-weight: 600;
       margin-bottom: 20px;
     }
-    input, textarea, button {
+    input, textarea, select, button {
       width: 100%;
       padding: 10px;
       margin-bottom: 20px;
       border: 1px solid #e0e0e0;
       border-radius: 4px;
       font-size: 16px;
+      box-sizing: border-box;
     }
     button {
       background-color: #007AFF;
@@ -88,7 +87,6 @@
       border-radius: 4px;
       margin-bottom: 20px;
     }
-    /* 채팅 영역 스타일 */
     #chat {
       margin-top: 40px;
     }
@@ -101,6 +99,17 @@
       margin-bottom: 10px;
       background-color: #fafafa;
     }
+    .inline-form {
+      display: inline-block;
+      width: auto;
+      margin-right: 8px;
+    }
+    .inline-form input,
+    .inline-form button,
+    .inline-form select {
+      width: auto;
+      margin-bottom: 8px;
+    }
   </style>
 </head>
 <body>
@@ -108,7 +117,11 @@
     {% if session.get('user_id') %}
       <a href="{{ url_for('dashboard') }}">대시보드</a>
       <a href="{{ url_for('profile') }}">프로필</a>
+      <a href="{{ url_for('wallet') }}">지갑</a>
       <a href="{{ url_for('report') }}">신고하기</a>
+      {% if current_user and current_user.role == 'admin' %}
+        <a href="{{ url_for('admin_dashboard') }}">관리자</a>
+      {% endif %}
       <form method="post" action="{{ url_for('logout') }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <button type="submit" class="logout-button">로그아웃</button>
